@@ -1,0 +1,541 @@
+// ============================================================================
+// DOM & SEA — Schéma de base de données
+// Plateforme de mise en relation logistique Métropole <-> DOM-TOM
+// ============================================================================
+// Convention : tous les modèles utilisent un id cuid(), des timestamps
+// createdAt/updatedAt, et des enums explicites pour les statuts métier.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  // À partir de Prisma 7, les URLs de connexion ne se déclarent plus ici
+  // mais dans le fichier prisma.config.ts à la racine du projet.
+}
+
+// ============================================================================
+// AUTHENTIFICATION & UTILISATEURS (compatible NextAuth / Auth.js v5)
+// ============================================================================
+
+enum UserRole {
+  CLIENT // Entreprise expéditrice de marchandises
+  PARTNER // Transitaire / commissionnaire / transporteur / logisticien
+  ADMIN // Équipe Dom & Sea
+}
+
+enum UserStatus {
+  PENDING // En attente de vérification email
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+model User {
+  id            String     @id @default(cuid())
+  name          String?
+  email         String     @unique
+  emailVerified DateTime?
+  image         String?
+  // Mot de passe haché (bcrypt). Null si l'utilisateur n'utilise qu'un
+  // provider OAuth (Google, etc.).
+  passwordHash  String?
+  role          UserRole   @default(CLIENT)
+  status        UserStatus @default(PENDING)
+  phone         String?
+  companyName   String?
+
+  // Relations NextAuth
+  accounts Account[]
+  sessions Session[]
+
+  // Relations métier
+  clientProfile   ClientProfile?
+  partnerProfile  PartnerProfile?
+  shipmentRequestsAsClient ShipmentRequest[] @relation("ClientRequests")
+  sentMessages    Message[]        @relation("MessageSender")
+  notifications   Notification[]
+  documents       Document[]       @relation("DocumentOwner")
+  activityLogs    ActivityLog[]
+  blogPosts       BlogPost[]       @relation("BlogAuthor")
+  passwordResetTokens PasswordResetToken[]
+  emailVerificationTokens EmailVerificationToken[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([email])
+  @@index([role, status])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([token])
+}
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  @@index([token])
+}
+
+// ============================================================================
+// PROFILS MÉTIER
+// ============================================================================
+
+model ClientProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  siret       String?
+  address     String?
+  city        String?
+  postalCode  String?
+  country     String  @default("France")
+  sector      String? // secteur d'activité
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum PartnerType {
+  TRANSITAIRE
+  COMMISSIONNAIRE
+  TRANSPORTEUR
+  LOGISTICIEN
+}
+
+enum PartnerStatus {
+  PENDING_REVIEW // inscription soumise, en attente de validation manuelle admin
+  APPROVED
+  REJECTED
+  SUSPENDED
+}
+
+model PartnerProfile {
+  id     String @id @default(cuid())
+  userId String @unique
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  partnerType   PartnerType
+  status        PartnerStatus @default(PENDING_REVIEW)
+  siret         String
+  address       String
+  city          String
+  postalCode    String
+  country       String        @default("France")
+  website       String?
+  description   String?       @db.Text
+  // Zones géographiques couvertes (codes destination), ex: ["GUADELOUPE","MARTINIQUE"]
+  coveredDestinations Destination[]
+  // Documents légaux justificatifs (Kbis, licence transport, assurance...)
+  legalDocuments Document[]   @relation("PartnerLegalDocuments")
+
+  // Validation manuelle par un admin
+  reviewedById  String?
+  reviewedAt    DateTime?
+  rejectionReason String?
+
+  averageRating Float?  @default(0)
+  ratingsCount  Int     @default(0)
+
+  responses     ShipmentResponse[]
+  ratings       PartnerRating[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([partnerType])
+}
+
+model PartnerRating {
+  id        String   @id @default(cuid())
+  partnerId String
+  partner   PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  shipmentRequestId String
+  shipmentRequest ShipmentRequest @relation(fields: [shipmentRequestId], references: [id], onDelete: Cascade)
+  score     Int      // 1 à 5
+  comment   String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@unique([partnerId, shipmentRequestId])
+}
+
+// ============================================================================
+// DEMANDES DE TRANSPORT (coeur du marketplace)
+// ============================================================================
+
+enum Destination {
+  GUADELOUPE
+  MARTINIQUE
+  GUYANE
+  REUNION
+  MAYOTTE
+  POLYNESIE
+  NOUVELLE_CALEDONIE
+  METROPOLE // utile si le flux est DOM-TOM -> métropole
+}
+
+enum GoodsType {
+  PALETTE_STANDARD
+  CONTENEUR_20_PIEDS
+  CONTENEUR_40_PIEDS
+  VRAC
+  COLIS
+  VEHICULE
+  MARCHANDISE_DANGEREUSE
+  PRODUITS_FRAIS_REFRIGERES
+  AUTRE
+}
+
+enum Frequency {
+  PONCTUEL
+  HEBDOMADAIRE
+  MENSUEL
+  TRIMESTRIEL
+  REGULIER_AUTRE
+}
+
+enum ShipmentRequestStatus {
+  NOUVELLE // vient d'être soumise, pas encore traitée
+  EN_COURS_DE_MATCHING // diffusée aux partenaires concernés
+  REPONSES_RECUES
+  DEVIS_ACCEPTE
+  EN_TRANSIT
+  LIVREE
+  ANNULEE
+  EXPIREE
+}
+
+model ShipmentRequest {
+  id     String @id @default(cuid())
+
+  // Le client peut être un compte enregistré OU un simple formulaire public
+  // (lead non authentifié converti ensuite en compte).
+  clientId String?
+  client   User?  @relation("ClientRequests", fields: [clientId], references: [id], onDelete: SetNull)
+
+  // Coordonnées (toujours stockées même si clientId existe, pour historique)
+  companyName String
+  contactName String
+  email       String
+  phone       String
+
+  origin      String      // ville/port de métropole
+  destination Destination
+
+  goodsType   GoodsType
+  goodsDescription String? @db.Text
+  weightKg    Float?
+  volumeM3    Float?
+
+  frequency        Frequency
+  desiredDate      DateTime?
+  comments         String?   @db.Text
+
+  status ShipmentRequestStatus @default(NOUVELLE)
+
+  // Anti-spam : score de confiance, IP, honeypot
+  spamScore   Int      @default(0)
+  ipAddress   String?
+  isVerifiedHuman Boolean @default(false)
+
+  responses     ShipmentResponse[]
+  messages      Message[]
+  documents     Document[]        @relation("ShipmentDocuments")
+  ratings       PartnerRating[]
+  statusHistory ShipmentStatusHistory[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([destination])
+  @@index([clientId])
+  @@index([createdAt])
+}
+
+model ShipmentStatusHistory {
+  id        String   @id @default(cuid())
+  shipmentRequestId String
+  shipmentRequest ShipmentRequest @relation(fields: [shipmentRequestId], references: [id], onDelete: Cascade)
+  fromStatus ShipmentRequestStatus?
+  toStatus   ShipmentRequestStatus
+  changedById String?
+  note       String?
+  createdAt  DateTime @default(now())
+
+  @@index([shipmentRequestId])
+}
+
+enum ResponseStatus {
+  PROPOSEE
+  ACCEPTEE
+  REFUSEE
+  RETIREE
+}
+
+// Réponse / devis d'un partenaire à une demande de transport
+model ShipmentResponse {
+  id        String   @id @default(cuid())
+  shipmentRequestId String
+  shipmentRequest ShipmentRequest @relation(fields: [shipmentRequestId], references: [id], onDelete: Cascade)
+
+  partnerId String
+  partner   PartnerProfile @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+
+  priceAmount   Decimal  @db.Decimal(10, 2)
+  currency      String   @default("EUR")
+  estimatedTransitDays Int?
+  message       String?  @db.Text
+  status        ResponseStatus @default(PROPOSEE)
+
+  // Document de devis PDF généré ou uploadé
+  quoteDocumentId String?
+  quoteDocument   Document? @relation(fields: [quoteDocumentId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([shipmentRequestId, partnerId])
+  @@index([status])
+}
+
+// ============================================================================
+// MESSAGERIE
+// ============================================================================
+
+model Message {
+  id        String   @id @default(cuid())
+  shipmentRequestId String
+  shipmentRequest ShipmentRequest @relation(fields: [shipmentRequestId], references: [id], onDelete: Cascade)
+
+  senderId  String
+  sender    User     @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  content   String   @db.Text
+  readAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([shipmentRequestId])
+  @@index([senderId])
+}
+
+// ============================================================================
+// DOCUMENTS (upload sécurisé)
+// ============================================================================
+
+enum DocumentType {
+  KBIS
+  LICENCE_TRANSPORT
+  ASSURANCE
+  DEVIS
+  FACTURE
+  CONNAISSEMENT // bill of lading
+  PHOTO_MARCHANDISE
+  AUTRE
+}
+
+model Document {
+  id          String       @id @default(cuid())
+  type        DocumentType
+  fileName    String
+  fileUrl     String       // URL de stockage sécurisé (S3 / UploadThing)
+  fileSizeBytes Int
+  mimeType    String
+
+  ownerId     String?
+  owner       User?        @relation("DocumentOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+
+  shipmentRequestId String?
+  shipmentRequest   ShipmentRequest? @relation("ShipmentDocuments", fields: [shipmentRequestId], references: [id], onDelete: Cascade)
+
+  partnerProfileId  String?
+  partnerProfile    PartnerProfile? @relation("PartnerLegalDocuments", fields: [partnerProfileId], references: [id], onDelete: Cascade)
+
+  shipmentResponses ShipmentResponse[]
+
+  isPublic    Boolean      @default(false)
+
+  createdAt DateTime @default(now())
+
+  @@index([ownerId])
+  @@index([shipmentRequestId])
+}
+
+// ============================================================================
+// NOTIFICATIONS
+// ============================================================================
+
+enum NotificationType {
+  NOUVELLE_DEMANDE
+  NOUVELLE_REPONSE
+  NOUVEAU_MESSAGE
+  STATUT_CHANGE
+  PARTENAIRE_VALIDE
+  PARTENAIRE_REJETE
+  DOCUMENT_AJOUTE
+  SYSTEME
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?
+  linkUrl   String?
+  readAt    DateTime?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt])
+}
+
+// ============================================================================
+// BLOG / CONTENU SEO
+// ============================================================================
+
+model BlogCategory {
+  id    String     @id @default(cuid())
+  name  String     @unique
+  slug  String     @unique
+  posts BlogPost[]
+}
+
+enum BlogPostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model BlogPost {
+  id          String         @id @default(cuid())
+  title       String
+  slug        String         @unique
+  excerpt     String
+  content     String         @db.Text
+  coverImageUrl String?
+
+  status      BlogPostStatus @default(DRAFT)
+  publishedAt DateTime?
+
+  authorId    String
+  author      User           @relation("BlogAuthor", fields: [authorId], references: [id])
+
+  categoryId  String?
+  category    BlogCategory?  @relation(fields: [categoryId], references: [id])
+
+  // SEO
+  metaTitle       String?
+  metaDescription String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, publishedAt])
+  @@index([categoryId])
+}
+
+// ============================================================================
+// TÉMOIGNAGES (page d'accueil)
+// ============================================================================
+
+model Testimonial {
+  id           String   @id @default(cuid())
+  authorName   String
+  authorRole   String?
+  companyName  String?
+  content      String   @db.Text
+  avatarUrl    String?
+  isFeatured   Boolean  @default(false)
+  createdAt    DateTime @default(now())
+}
+
+// ============================================================================
+// JOURNAL D'ACTIVITÉ (audit log)
+// ============================================================================
+
+model ActivityLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String   // ex: "USER_LOGIN", "SHIPMENT_CREATED", "PARTNER_APPROVED"
+  entityType String?
+  entityId  String?
+  metadata  Json?
+  ipAddress String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ============================================================================
+// CONTACT (formulaire de contact générique, hors devis)
+// ============================================================================
+
+model ContactMessage {
+  id        String   @id @default(cuid())
+  name      String
+  email     String
+  subject   String
+  message   String   @db.Text
+  isHandled Boolean  @default(false)
+  createdAt DateTime @default(now())
+}
