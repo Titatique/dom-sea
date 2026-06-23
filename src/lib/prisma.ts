@@ -1,17 +1,18 @@
 import { PrismaClient } from "@prisma/client";
-
-// En développement, Next.js recharge les modules à chaud (HMR), ce qui peut
-// créer de nouvelles instances de PrismaClient à chaque sauvegarde et finir
-// par épuiser les connexions disponibles à la base de données.
-// On stocke donc l'instance sur l'objet global en dev pour la réutiliser.
+import { PrismaPg } from "@prisma/adapter-pg";
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
 };
 
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL,
+});
+
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
+    adapter,
     log:
       process.env.NODE_ENV === "development"
         ? ["query", "error", "warn"]
